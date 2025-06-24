@@ -1,26 +1,24 @@
 from collections import deque
+from dataclasses import dataclass, field
 import xxhash
 import numpy as np
+from typing import Optional
 
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, Turn
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
-        self.hash = -1
-        self.token_ids = []
 
-    def update(self, hash: int, token_ids: list[int]):
-        self.hash = hash
-        self.token_ids = token_ids
 
-    def reset(self):
-        self.ref_count = 1
-        self.hash = -1
-        self.token_ids = []
+@dataclass
+class TurnData:
+    token_ids: list[int]
+    block_table: list[int]
+    cache_group_ids: set[str] = field(default_factory=set)
+    first_seen_context_hash: Optional[int] = None
 
 
 class BlockManager:
@@ -29,85 +27,130 @@ class BlockManager:
         assert num_blocks > 0
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        self.turn_cache: dict[int, TurnData] = {}
+        self.context_hashes: set[int] = set()
 
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    @staticmethod
+    def compute_context_hash(turn_hashes: list[int]) -> int:
         h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        h.update(str(turn_hashes).encode('utf-8'))
         return h.intdigest()
 
-    def _allocate_block(self, block_id: int) -> Block:
-        block = self.blocks[block_id]
-        assert block.ref_count == 0
-        block.reset()
-        self.free_block_ids.remove(block_id)
-        self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
-
-    def _deallocate_block(self, block_id: int) -> Block:
+    def _allocate_physical_block(self) -> Optional[int]:
+        if not self.free_block_ids:
+            return None
+        block_id = self.free_block_ids.popleft()
         assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        return block_id
+
+    def _free_physical_block(self, block_id: int):
+        block = self.blocks[block_id]
+        assert block.ref_count > 0
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        required_blocks = 0
+        for turn in seq.turns:
+            if turn.hash not in self.turn_cache:
+                required_blocks += turn.num_blocks
+        return len(self.free_block_ids) >= required_blocks
 
-    def allocate(self, seq: Sequence):
-        assert not seq.block_table
-        h = -1
-        cache_miss = False
-        for i in range(seq.num_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True
-            if cache_miss:
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
-            else:
-                seq.num_cached_tokens += self.block_size
-                if block_id in self.used_block_ids:
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
+    def match_and_allocate(self, seq: Sequence) -> bool:
+        seq_turn_hashes = seq.turn_hashes
+        matched_turns: dict[int, TurnData] = {}
+        use_strict_prefix = True
+
+        if seq.cache_group_id:
+            all_turns_in_group = True
+            for turn_hash in seq_turn_hashes:
+                if turn_hash in self.turn_cache and seq.cache_group_id in self.turn_cache[turn_hash].cache_group_ids:
+                    matched_turns[turn_hash] = self.turn_cache[turn_hash]
                 else:
-                    block = self._allocate_block(block_id)
-            if h != -1:
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
-            seq.block_table.append(block_id)
+                    all_turns_in_group = False
+                    break
+            if all_turns_in_group:
+                use_strict_prefix = False
+
+        if use_strict_prefix:
+            context_hash = self.compute_context_hash(seq_turn_hashes)
+            if context_hash not in self.context_hashes:
+                for i in range(len(seq_turn_hashes), 0, -1):
+                    prefix_hashes = seq_turn_hashes[:i]
+                    prefix_context_hash = self.compute_context_hash(prefix_hashes)
+                    if prefix_context_hash in self.context_hashes:
+                        for turn_hash in prefix_hashes:
+                            matched_turns[turn_hash] = self.turn_cache[turn_hash]
+                        break
+
+        blocks_to_allocate = 0
+        allocation_plan = []
+        for turn in seq.turns:
+            if turn.hash in matched_turns:
+                allocation_plan.append({'type': 'reuse', 'turn_data': matched_turns[turn.hash]})
+            else:
+                num_new_tokens = turn.num_tokens
+                offset = 0
+                num_blocks_needed = (offset + num_new_tokens + self.block_size - 1) // self.block_size
+                blocks_to_allocate += num_blocks_needed
+                allocation_plan.append({'type': 'alloc', 'turn': turn, 'num_blocks': num_blocks_needed})
+
+        if len(self.free_block_ids) < blocks_to_allocate:
+            return False
+
+        final_block_table = []
+        seq.num_cached_tokens = 0
+
+        for plan in allocation_plan:
+            if plan['type'] == 'reuse':
+                turn_data = plan['turn_data']
+                final_block_table.extend(turn_data.block_table)
+                seq.num_cached_tokens += len(turn_data.token_ids)
+                for block_id in turn_data.block_table:
+                    self.blocks[block_id].ref_count += 1
+
+            elif plan['type'] == 'alloc':
+                turn = plan['turn']
+                num_blocks = plan['num_blocks']
+                newly_allocated_blocks = []
+                for _ in range(num_blocks):
+                    block_id = self._allocate_physical_block()
+                    self.blocks[block_id].ref_count = 1
+                    newly_allocated_blocks.append(block_id)
+
+                final_block_table.extend(newly_allocated_blocks)
+
+                new_turn_data = TurnData(
+                    token_ids=turn.token_ids,
+                    block_table=newly_allocated_blocks,
+                    cache_group_ids=set(),
+                )
+                if seq.cache_group_id:
+                    new_turn_data.cache_group_ids.add(seq.cache_group_id)
+                self.turn_cache[turn.hash] = new_turn_data
+
+        if use_strict_prefix:
+            context_hash = self.compute_context_hash(seq_turn_hashes)
+            self.context_hashes.add(context_hash)
+
+        seq.block_table = final_block_table
+        return True
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
-            block = self.blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        for block_id in seq.block_table:
+            self._free_physical_block(block_id)
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 0)
 
     def may_append(self, seq: Sequence):
-        block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            assert last_block.hash == -1
+        if len(seq) > 0 and (len(seq) - 1) % self.block_size == 0:
+            block_id = self._allocate_physical_block()
+            if block_id is None:
+                raise MemoryError("Out of blocks for decoding")
+
+            self.blocks[block_id].ref_count = 1
+            seq.block_table.append(block_id)

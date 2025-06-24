@@ -22,7 +22,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-    
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -123,23 +123,29 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        for seq in seqs:
+
+        all_tokens_list = [s.token_ids for s in seqs]
+
+        for i, seq in enumerate(seqs):
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
+            prompt_tokens = all_tokens_list[i]
+
+            tokens_to_compute = prompt_tokens[seq.num_cached_tokens:]
+            input_ids.extend(tokens_to_compute)
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
+            seqlen_q = len(tokens_to_compute)
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+
+            for token_idx in range(seq.num_cached_tokens, seqlen):
+                block_idx = token_idx // self.block_size
+                block_offset = token_idx % self.block_size
+                slot = seq.block_table[block_idx] * self.block_size + block_offset
+                slot_mapping.append(slot)
+
         assert len(input_ids) == len(slot_mapping)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -158,9 +164,14 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq))
+            positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            token_idx = len(seq) - 1
+            block_idx = token_idx // self.block_size
+            block_offset = token_idx % self.block_size
+            slot = seq.block_table[block_idx] * self.block_size + block_offset
+            slot_mapping.append(slot)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -211,7 +222,7 @@ class ModelRunner:
         rng_state = torch.cuda.get_rng_state()
         torch.cuda.get_rng_state = lambda: rng_state
         torch.cuda.set_rng_state = lambda _: None
-    
+
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
