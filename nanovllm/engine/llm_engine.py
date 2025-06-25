@@ -15,7 +15,7 @@ from nanovllm.engine.model_runner import ModelRunner
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, verbose: bool = False, **kwargs):
         config_fileds = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fileds}
         config = Config(model, **config_kwargs)
@@ -32,7 +32,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         self.im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        self.scheduler = Scheduler(config, verbose=verbose)
         atexit.register(self.exit)
 
     def exit(self):
@@ -85,7 +85,11 @@ class LLMEngine:
         for i, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
             sp_copy = SamplingParams(**sp.__dict__)
             cache_group_id = self.add_request(prompt, sp_copy)
-            request_map[self.scheduler.waiting[-1].seq_id] = (i, cache_group_id)
+            # Find the sequence just added to map its seq_id to original index
+            for s in self.scheduler.waiting:
+                 if s.cache_group_id == cache_group_id:
+                     request_map[s.seq_id] = (i, cache_group_id)
+                     break
 
         outputs_by_index = [None] * len(prompts)
 
@@ -103,6 +107,7 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             for seq_id, token_ids, out_cache_group_id in output:
+                if seq_id not in request_map: continue
                 original_index, _ = request_map[seq_id]
                 outputs_by_index[original_index] = {
                     "text": self.tokenizer.decode(token_ids),
@@ -114,9 +119,9 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
 
-        for i in range(len(prompts)):
-            if outputs_by_index[i] is None:
-                _, cache_group_id = request_map[i]
-                outputs_by_index[i] = {"text": "", "token_ids": [], "cache_group_id": cache_group_id, "error": "Generation failed"}
+        # Fill in any failed/unscheduled requests
+        for seq_id, (original_index, cache_group_id) in request_map.items():
+            if outputs_by_index[original_index] is None:
+                outputs_by_index[original_index] = {"text": "", "token_ids": [], "cache_group_id": cache_group_id, "error": "Generation failed or was not scheduled"}
 
         return outputs_by_index
