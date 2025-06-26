@@ -18,7 +18,6 @@ class TurnData:
     token_ids: list[int]
     block_table: list[int]
     cache_group_ids: set[str] = field(default_factory=set)
-    first_seen_context_hash: Optional[int] = None
 
 
 class BlockManager:
@@ -34,7 +33,7 @@ class BlockManager:
     @staticmethod
     def compute_context_hash(turn_hashes: list[int]) -> int:
         h = xxhash.xxh64()
-        h.update(str(turn_hashes).encode('utf-8'))
+        h.update(str(tuple(turn_hashes)).encode('utf-8'))
         return h.intdigest()
 
     def _allocate_physical_block(self) -> Optional[int]:
@@ -54,8 +53,7 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> bool:
         required_blocks = 0
         for turn in seq.turns:
-            if turn.hash not in self.turn_cache:
-                required_blocks += turn.num_blocks
+            required_blocks += turn.num_blocks
         return len(self.free_block_ids) >= required_blocks
 
     def match_and_allocate(self, seq: Sequence) -> bool:
@@ -64,36 +62,32 @@ class BlockManager:
         use_strict_prefix = True
 
         if seq.cache_group_id:
-            all_turns_in_group = True
+            found_match_in_group = False
             for turn_hash in seq_turn_hashes:
                 if turn_hash in self.turn_cache and seq.cache_group_id in self.turn_cache[turn_hash].cache_group_ids:
                     matched_turns[turn_hash] = self.turn_cache[turn_hash]
-                else:
-                    all_turns_in_group = False
-                    break
-            if all_turns_in_group:
+                    found_match_in_group = True
+
+            if found_match_in_group:
                 use_strict_prefix = False
 
         if use_strict_prefix:
-            context_hash = self.compute_context_hash(seq_turn_hashes)
-            if context_hash not in self.context_hashes:
-                for i in range(len(seq_turn_hashes), 0, -1):
-                    prefix_hashes = seq_turn_hashes[:i]
-                    prefix_context_hash = self.compute_context_hash(prefix_hashes)
-                    if prefix_context_hash in self.context_hashes:
-                        for turn_hash in prefix_hashes:
-                            matched_turns[turn_hash] = self.turn_cache[turn_hash]
-                        break
+            matched_turns.clear()
+            for i in range(len(seq_turn_hashes), 0, -1):
+                prefix_hashes = seq_turn_hashes[:i]
+                prefix_context_hash = self.compute_context_hash(prefix_hashes)
+                if prefix_context_hash in self.context_hashes:
+                    for turn_hash in prefix_hashes:
+                        matched_turns[turn_hash] = self.turn_cache[turn_hash]
+                    break
 
         blocks_to_allocate = 0
         allocation_plan = []
         for turn in seq.turns:
             if turn.hash in matched_turns:
-                allocation_plan.append({'type': 'reuse', 'turn_data': matched_turns[turn.hash]})
+                allocation_plan.append({'type': 'reuse', 'turn_hash': turn.hash})
             else:
-                num_new_tokens = turn.num_tokens
-                offset = 0
-                num_blocks_needed = (offset + num_new_tokens + self.block_size - 1) // self.block_size
+                num_blocks_needed = turn.num_blocks
                 blocks_to_allocate += num_blocks_needed
                 allocation_plan.append({'type': 'alloc', 'turn': turn, 'num_blocks': num_blocks_needed})
 
@@ -102,14 +96,20 @@ class BlockManager:
 
         final_block_table = []
         seq.num_cached_tokens = 0
+        updated_group_ids_for_turns = set()
 
         for plan in allocation_plan:
             if plan['type'] == 'reuse':
-                turn_data = plan['turn_data']
+                turn_data = matched_turns[plan['turn_hash']]
                 final_block_table.extend(turn_data.block_table)
                 seq.num_cached_tokens += len(turn_data.token_ids)
+
                 for block_id in turn_data.block_table:
                     self.blocks[block_id].ref_count += 1
+
+                if seq.cache_group_id and plan['turn_hash'] not in updated_group_ids_for_turns:
+                    turn_data.cache_group_ids.add(seq.cache_group_id)
+                    updated_group_ids_for_turns.add(plan['turn_hash'])
 
             elif plan['type'] == 'alloc':
                 turn = plan['turn']
@@ -125,15 +125,14 @@ class BlockManager:
                 new_turn_data = TurnData(
                     token_ids=turn.token_ids,
                     block_table=newly_allocated_blocks,
-                    cache_group_ids=set(),
+                    cache_group_ids={seq.cache_group_id} if seq.cache_group_id else set(),
                 )
-                if seq.cache_group_id:
-                    new_turn_data.cache_group_ids.add(seq.cache_group_id)
                 self.turn_cache[turn.hash] = new_turn_data
 
-        if use_strict_prefix:
-            context_hash = self.compute_context_hash(seq_turn_hashes)
-            self.context_hashes.add(context_hash)
+        for i in range(1, len(seq_turn_hashes) + 1):
+             prefix_hashes = seq_turn_hashes[:i]
+             context_hash = self.compute_context_hash(prefix_hashes)
+             self.context_hashes.add(context_hash)
 
         seq.block_table = final_block_table
         return True
