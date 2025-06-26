@@ -1,3 +1,5 @@
+# In nanovllm/engine/llm_engine.py
+
 import atexit
 from dataclasses import fields
 from time import perf_counter
@@ -31,7 +33,11 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         self.im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+
+        if self.tokenizer.bos_token_id is None:
+            self.tokenizer.bos_token = self.tokenizer.eos_token
         config.eos = self.tokenizer.eos_token_id
+
         self.scheduler = Scheduler(config, verbose=verbose)
         atexit.register(self.exit)
 
@@ -45,6 +51,8 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
 
+        if not prompt:
+            prompt = [self.tokenizer.bos_token_id]
         if sampling_params.cache_group_id is None:
             sampling_params.cache_group_id = str(uuid.uuid4())
 
@@ -85,7 +93,6 @@ class LLMEngine:
         for i, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
             sp_copy = SamplingParams(**sp.__dict__)
             cache_group_id = self.add_request(prompt, sp_copy)
-            # Find the sequence just added to map its seq_id to original index
             for s in self.scheduler.waiting:
                  if s.cache_group_id == cache_group_id:
                      request_map[s.seq_id] = (i, cache_group_id)
@@ -97,11 +104,13 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t) if (perf_counter() -t) > 0 else 0
+            if use_tqdm and num_tokens > 0:
+                elapsed = perf_counter() - t
+                throughput = num_tokens / elapsed if elapsed > 0 else float('inf')
+                if any(s.num_cached_tokens < len(s) for s in self.scheduler.running if s.num_cached_tokens > 0): # Rough check for prefill
+                    prefill_throughput = throughput
                 else:
-                    decode_throughput = num_tokens / (perf_counter() - t) if (perf_counter() -t) > 0 else 0
+                    decode_throughput = throughput
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
@@ -119,7 +128,6 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
 
-        # Fill in any failed/unscheduled requests
         for seq_id, (original_index, cache_group_id) in request_map.items():
             if outputs_by_index[original_index] is None:
                 outputs_by_index[original_index] = {"text": "", "token_ids": [], "cache_group_id": cache_group_id, "error": "Generation failed or was not scheduled"}

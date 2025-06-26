@@ -36,7 +36,7 @@ class Scheduler:
                 continue
 
             if self.block_manager.match_and_allocate(seq):
-                if seq.num_cached_tokens == len(seq):
+                if len(seq) > 0 and seq.num_cached_tokens == len(seq):
                     if self.verbose:
                         print(
                             f"[Scheduler] Scheduling Seq {seq.seq_id} (Prefill): "
