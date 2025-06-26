@@ -156,14 +156,25 @@ class BlockManager:
             if found_in_group:
                 return plan, False
 
+        if not seq.turns:
+            return plan, True
+
         current_seq_node = self.turn_cache.root
+        sequence_matched_len = 0
         for i, turn in enumerate(seq.turns):
             turn_radix_node = self.turn_cache.find_exact_match_node(turn.token_ids)
             if turn_radix_node and turn_radix_node.node_id in current_seq_node.sequential_children:
                 plan[i] = {"parent_radix_node": turn_radix_node, "matched_len": len(turn.token_ids)}
                 current_seq_node = turn_radix_node
+                sequence_matched_len += 1
             else:
                 break
+
+        if sequence_matched_len == 0:
+            first_turn = seq.turns[0]
+            radix_node, matched_len = self.turn_cache.find_longest_prefix_node(first_turn.token_ids)
+            if matched_len > 0:
+                plan[0] = {"parent_radix_node": radix_node, "matched_len": matched_len}
 
         return plan, True
 
