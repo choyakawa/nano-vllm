@@ -1,7 +1,6 @@
 from enum import Enum, auto
 from itertools import count, chain
 from typing import Optional
-import xxhash
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -12,20 +11,9 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 class Turn:
-    def __init__(self, token_ids: list[int]):
+    def __init__(self, token_ids: list[int], block_size: int):
         self.token_ids = token_ids
-        # A unique identifier for the content of this turn.
-        self.hash = self.compute_hash(token_ids)
-
-        # Populated by BlockManager
-        self.block_table: list[int] = []
-        self.num_cached_tokens: int = 0
-
-    @staticmethod
-    def compute_hash(token_ids: list[int]) -> int:
-        h = xxhash.xxh64()
-        h.update(str(token_ids).encode('utf-8'))
-        return h.intdigest()
+        self._block_size = block_size
 
     @property
     def num_tokens(self) -> int:
@@ -33,7 +21,9 @@ class Turn:
 
     @property
     def num_blocks(self) -> int:
-        return (self.num_tokens + Sequence.block_size - 1) // Sequence.block_size
+        if not self.token_ids:
+            return 0
+        return (self.num_tokens + self._block_size - 1) // self._block_size
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -52,9 +42,10 @@ class Sequence:
             current_turn_start_idx = 0
             for i, token_id in enumerate(token_ids):
                 if i > 0 and token_id == im_start_id:
-                    self.turns.append(Turn(token_ids[current_turn_start_idx:i]))
+                    self.turns.append(Turn(token_ids[current_turn_start_idx:i], self.block_size))
                     current_turn_start_idx = i
-            self.turns.append(Turn(token_ids[current_turn_start_idx:]))
+            self.turns.append(Turn(token_ids[current_turn_start_idx:], self.block_size))
+
         self.num_prompt_tokens = len(token_ids)
         self.num_tokens = self.num_prompt_tokens
         self.block_table: list[int] = []
@@ -63,10 +54,6 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-
-    @property
-    def turn_hashes(self) -> list[int]:
-        return [t.hash for t in self.turns]
 
     def __len__(self):
         return self.num_tokens
