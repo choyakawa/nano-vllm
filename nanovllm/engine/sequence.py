@@ -1,8 +1,11 @@
 from enum import Enum, auto
 from itertools import count, chain
-from typing import Optional
+from typing import Optional, List
 
 from nanovllm.sampling_params import SamplingParams
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from nanovllm.engine.block_manager import CacheNode
 
 
 class SequenceStatus(Enum):
@@ -49,6 +52,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_tokens = self.num_prompt_tokens
         self.block_table: list[int] = []
+        self.turn_cache_nodes: List[Optional['CacheNode']] = [None] * len(self.turns)
         self.num_cached_tokens: int = 0
         self.completion_token_ids: list[int] = []
         self.temperature = sampling_params.temperature
