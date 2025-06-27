@@ -214,10 +214,26 @@ class BlockManager:
             parent_cache_node = parent_radix_node.data
             matched_len = match_plan[i]["matched_len"]
             len_total = len(turn.token_ids)
-            total_matched_tokens += matched_len
             ancestors = self._get_ancestors(parent_cache_node)
             cached_blocks_list = [b for n in reversed(ancestors) for b in n.block_table]
             blocks_for_matched_prefix = (matched_len + self.block_size - 1) // self.block_size
+            if matched_len % self.block_size != 0 and matched_len < len_total:
+                conflict = False
+                if blocks_for_matched_prefix == 0:
+                    conflict = True
+                else:
+                    last_block_id = cached_blocks_list[blocks_for_matched_prefix - 1]
+                    if self.blocks[last_block_id].ref_count > 0:
+                        conflict = True
+                if conflict:
+                    matched_len -= matched_len % self.block_size
+                    blocks_for_matched_prefix = matched_len // self.block_size
+                    if matched_len == 0:
+                        parent_radix_node = self.turn_cache.root
+                        parent_cache_node = parent_radix_node.data
+                        ancestors = [parent_cache_node]
+                        cached_blocks_list = []
+            cached_blocks_for_prefix = cached_blocks_list[:blocks_for_matched_prefix]
             blocks_for_full_turn = (len_total + self.block_size - 1) // self.block_size
             num_new_blocks = blocks_for_full_turn - blocks_for_matched_prefix
             total_blocks_needed += num_new_blocks
@@ -226,8 +242,10 @@ class BlockManager:
                 "parent_radix_node": parent_radix_node,
                 "num_new_blocks": num_new_blocks,
                 "tokens_to_cache": turn.token_ids[matched_len:],
-                "cached_blocks_for_prefix": cached_blocks_list[:blocks_for_matched_prefix]
+                "cached_blocks_for_prefix": cached_blocks_for_prefix,
             })
+
+            total_matched_tokens += matched_len
 
         if len(self.free_block_ids) < total_blocks_needed: return False
 
