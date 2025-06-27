@@ -212,12 +212,16 @@ class BlockManager:
         for i, turn in enumerate(seq.turns):
             parent_radix_node = match_plan[i]["parent_radix_node"]
             parent_cache_node = parent_radix_node.data
-            matched_len = match_plan[i]["matched_len"]
+            matched_len_orig = match_plan[i]["matched_len"]
             len_total = len(turn.token_ids)
-            total_matched_tokens += matched_len
+            if matched_len_orig < len_total and matched_len_orig % self.block_size != 0:
+                effective_matched_len = matched_len_orig - (matched_len_orig % self.block_size)
+            else:
+                effective_matched_len = matched_len_orig
+            total_matched_tokens += effective_matched_len
             ancestors = self._get_ancestors(parent_cache_node)
             cached_blocks_list = [b for n in reversed(ancestors) for b in n.block_table]
-            blocks_for_matched_prefix = (matched_len + self.block_size - 1) // self.block_size
+            blocks_for_matched_prefix = effective_matched_len // self.block_size
             blocks_for_full_turn = (len_total + self.block_size - 1) // self.block_size
             num_new_blocks = blocks_for_full_turn - blocks_for_matched_prefix
             total_blocks_needed += num_new_blocks
@@ -225,7 +229,7 @@ class BlockManager:
             allocation_details.append({
                 "parent_radix_node": parent_radix_node,
                 "num_new_blocks": num_new_blocks,
-                "tokens_to_cache": turn.token_ids[matched_len:],
+                "tokens_to_cache": turn.token_ids[effective_matched_len:],
                 "cached_blocks_for_prefix": cached_blocks_list[:blocks_for_matched_prefix]
             })
 
